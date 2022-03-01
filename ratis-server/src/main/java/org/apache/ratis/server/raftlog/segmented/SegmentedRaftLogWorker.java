@@ -144,6 +144,7 @@ class SegmentedRaftLogWorker {
   private final WriteLogTasks writeTasks = new WriteLogTasks();
   private volatile boolean running = true;
   private final Thread workerThread;
+  private final Thread outStreamFlushThread;
 
   private final RaftStorage storage;
   private volatile SegmentedRaftLogOutputStream out;
@@ -176,7 +177,7 @@ class SegmentedRaftLogWorker {
   private final RaftServer.Division server;
   private int flushBatchSize;
 
-  private Timestamp lastFlush;
+  private Timestamp outStreamLastFlush;
   private final TimeDuration flushIntervalMin;
 
   private final StateMachineDataPolicy stateMachineDataPolicy;
@@ -205,6 +206,7 @@ class SegmentedRaftLogWorker {
     this.stateMachineDataPolicy = new StateMachineDataPolicy(properties, metricRegistry);
 
     this.workerThread = new Thread(this::run, name);
+    this.outStreamFlushThread = new Thread(this::checkAndFlush, name + "outStreamFlush");
 
     // Server Id can be null in unit tests
     metricRegistry.addDataQueueSizeGauge(queue);
@@ -217,7 +219,7 @@ class SegmentedRaftLogWorker {
 
     final int bufferSize = RaftServerConfigKeys.Log.writeBufferSize(properties).getSizeInt();
     this.writeBuffer = ByteBuffer.allocateDirect(bufferSize);
-    this.lastFlush = Timestamp.currentTime();
+    this.outStreamLastFlush = Timestamp.currentTime();
     this.flushIntervalMin = RaftServerConfigKeys.Log.flushIntervalMin(properties);
   }
 
@@ -231,11 +233,15 @@ class SegmentedRaftLogWorker {
       allocateSegmentedRaftLogOutputStream(openSegmentFile, true);
     }
     workerThread.start();
+    if (flushIntervalMin.getDuration() > 0) {
+      outStreamFlushThread.start();
+    }
   }
 
   void close() {
     this.running = false;
     workerThread.interrupt();
+    outStreamFlushThread.interrupt();
     try {
       workerThread.join(3000);
     } catch (InterruptedException ignored) {
@@ -326,7 +332,6 @@ class SegmentedRaftLogWorker {
           }
           task.done();
         }
-        flushIfNecessary();
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         if (running) {
@@ -349,13 +354,25 @@ class SegmentedRaftLogWorker {
     }
   }
 
+  private void checkAndFlush() {
+    while (running) {
+      try {
+        outStreamFlushIfNecessary();
+        flushIntervalMin.sleep();
+      } catch (Exception e) {
+        LOG.error("{} hit exception", Thread.currentThread().getName(), e);
+        Optional.ofNullable(server).ifPresent(RaftServer.Division::close);
+      }
+    }
+  }
+
   private boolean shouldFlush() {
     if (out == null) {
       return false;
     } else if (pendingFlushNum >= forceSyncNum) {
       return true;
     }
-    return pendingFlushNum > 0 && queue.isEmpty() && lastFlush.elapsedTime().compareTo(flushIntervalMin) > 0;
+    return pendingFlushNum > 0 && queue.isEmpty();
   }
 
   @SuppressFBWarnings("NP_NULL_PARAM_DEREF")
@@ -371,18 +388,29 @@ class SegmentedRaftLogWorker {
         if (stateMachineDataPolicy.isSync()) {
           stateMachineDataPolicy.getFromFuture(f, () -> this + "-flushStateMachineData");
         }
-        final Timer.Context logSyncTimerContext = raftLogSyncTimer.time();
-        flushBatchSize = (int)(lastWrittenIndex - flushIndex.get());
-        out.flush();
-        logSyncTimerContext.stop();
+        if (flushIntervalMin.getDuration() == 0) {
+          outStreamFlushIfNecessary();
+        }
         if (!stateMachineDataPolicy.isSync()) {
           IOUtils.getFromFuture(f, () -> this + "-flushStateMachineData");
         }
       } finally {
         timerContext.stop();
-        lastFlush = Timestamp.currentTime();
       }
       updateFlushedIndexIncreasingly();
+    }
+  }
+
+  private void outStreamFlushIfNecessary() throws IOException {
+    if (out == null) {
+      return;
+    }
+    if (flushIntervalMin.getDuration() ==0 || outStreamLastFlush.elapsedTime().compareTo(flushIntervalMin) > 0) {
+      final Timer.Context logSyncTimerContext = raftLogSyncTimer.time();
+      flushBatchSize = (int)(lastWrittenIndex - flushIndex.get());
+      out.flush();
+      logSyncTimerContext.stop();
+      outStreamLastFlush = Timestamp.currentTime();
     }
   }
 
