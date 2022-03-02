@@ -42,7 +42,7 @@ public class MessageMetrics extends RatisMetrics {
    * @param rpcType
    */
   public void rpcStarted(String rpcType){
-    //noop
+    registry.counter(rpcType + "_started_total").inc();
   }
 
   /**
@@ -51,7 +51,7 @@ public class MessageMetrics extends RatisMetrics {
    * @param rpcType
    */
   public void rpcCompleted(String rpcType){
-    //noop
+    registry.counter(rpcType + "_completed_total").inc();
   }
 
   /**
@@ -59,7 +59,7 @@ public class MessageMetrics extends RatisMetrics {
    * @param rpcType
    */
   public void rpcReceived(String rpcType){
-    //noop
+    registry.counter(rpcType + "_received_executed").inc();
   }
 
 }
